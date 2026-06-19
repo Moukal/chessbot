@@ -22,5 +22,5 @@ private:
     Piece matchSquare(const cv::Mat& squareImg) const;
 
     std::map<Piece, PieceTemplate> m_templates;
-    double m_threshold = 0.72;
+    double m_threshold = 0.28; // SQDIFF_NORMED: accept match if score < threshold
 };

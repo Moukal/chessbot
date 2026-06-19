@@ -69,15 +69,15 @@ Piece TemplatePieceRecognizer::matchSquare(const cv::Mat& squareGray) const {
     cv::resize(squareGray, sq, cv::Size(64, 64));
 
     Piece best = Piece::None;
-    double bestScore = m_threshold;
+    double bestScore = m_threshold; // SQDIFF_NORMED: lower = better match
 
     for (const auto& [piece, tmpl] : m_templates) {
         cv::Mat result;
-        cv::matchTemplate(sq, tmpl.gray, result, cv::TM_CCORR_NORMED, tmpl.mask);
-        double maxVal;
-        cv::minMaxLoc(result, nullptr, &maxVal);
-        if (maxVal > bestScore) {
-            bestScore = maxVal;
+        cv::matchTemplate(sq, tmpl.gray, result, cv::TM_SQDIFF_NORMED, tmpl.mask);
+        double minVal;
+        cv::minMaxLoc(result, &minVal, nullptr);
+        if (minVal < bestScore) {
+            bestScore = minVal;
             best = piece;
         }
     }
