@@ -1,13 +1,10 @@
 #include "IDesktopCapture.hpp"
 #include "../infrastructure/Logger.hpp"
 #include <QApplication>
-#include <QCoreApplication>
 #include <QDBusArgument>
 #include <QDBusConnection>
 #include <QDBusInterface>
-#include <QDBusMetaType>
 #include <QDBusReply>
-#include <QDBusUnixFileDescriptor>
 #include <QDir>
 #include <QEventLoop>
 #include <QFile>
@@ -19,13 +16,8 @@
 #include <QProcessEnvironment>
 #include <QUrl>
 #include <QTimer>
-#include <gst/app/gstappsink.h>
-#include <gst/gst.h>
-#include <gst/video/video.h>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
-#include <optional>
 #include <string>
 #include <unistd.h>
 
@@ -33,28 +25,6 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #endif
-
-struct PortalStream {
-    uint nodeId = 0;
-    QVariantMap properties;
-};
-
-Q_DECLARE_METATYPE(PortalStream)
-Q_DECLARE_METATYPE(QList<PortalStream>)
-
-const QDBusArgument& operator>>(const QDBusArgument& argument, PortalStream& stream) {
-    argument.beginStructure();
-    argument >> stream.nodeId >> stream.properties;
-    argument.endStructure();
-    return argument;
-}
-
-QDBusArgument& operator<<(QDBusArgument& argument, const PortalStream& stream) {
-    argument.beginStructure();
-    argument << stream.nodeId << stream.properties;
-    argument.endStructure();
-    return argument;
-}
 
 class PortalResponseWaiter : public QObject {
     Q_OBJECT
@@ -111,300 +81,6 @@ private:
     bool m_received = false;
 };
 
-struct PortalScreenCastSession {
-    QString sessionHandle;
-    int pipeWireFd = -1;
-    uint nodeId = 0;
-    quint64 pipewireSerial = 0;
-
-    std::string targetObject() const {
-        if (pipewireSerial > 0)
-            return std::to_string(pipewireSerial);
-        if (nodeId > 0)
-            return std::to_string(nodeId);
-        return {};
-    }
-};
-
-static QString objectPathFromVariant(const QVariant& value) {
-    if (value.canConvert<QDBusObjectPath>())
-        return value.value<QDBusObjectPath>().path();
-    return value.toString();
-}
-
-class PortalGStreamerCapture {
-public:
-    ~PortalGStreamerCapture() {
-        stop();
-    }
-
-    bool hasFailed() const { return m_failed; }
-
-    QImage captureFrame() {
-        if (m_failed) return {};
-        if (!ensureStarted()) {
-            m_failed = true;   // Don't retry — portal requires user action at startup
-            return {};
-        }
-
-        GstSample* sample = gst_app_sink_try_pull_sample(m_appSink, 250 * GST_MSECOND);
-        if (!sample) {
-            LOG_WARN("Portal/GStreamer capture has no frame available yet");
-            return {};
-        }
-
-        QImage image = sampleToImage(sample);
-        gst_sample_unref(sample);
-        if (!image.isNull())
-            LOG_TRACE("Captured screen with xdg-desktop-portal/PipeWire/GStreamer: {}x{}",
-                      image.width(), image.height());
-        return image;
-    }
-
-private:
-    bool ensureStarted() {
-        if (m_pipeline && m_appSink)
-            return true;
-
-        static std::once_flag gstInitFlag;
-        std::call_once(gstInitFlag, []() {
-            gst_init(nullptr, nullptr);
-        });
-
-        auto session = createPortalSession();
-        if (!session) {
-            LOG_WARN("Portal ScreenCast session could not be created");
-            return false;
-        }
-
-        m_pipeWireFd = session->pipeWireFd;
-        m_targetObject = session->targetObject();
-        LOG_INFO("Portal ScreenCast ready: nodeId={} pipewireSerial={} targetObject='{}' fd={}",
-                 session->nodeId, session->pipewireSerial, m_targetObject, m_pipeWireFd);
-
-        return startPipeline();
-    }
-
-    std::optional<PortalScreenCastSession> createPortalSession() {
-        qDBusRegisterMetaType<PortalStream>();
-        qDBusRegisterMetaType<QList<PortalStream>>();
-
-        QDBusInterface portal(
-            "org.freedesktop.portal.Desktop",
-            "/org/freedesktop/portal/desktop",
-            "org.freedesktop.portal.ScreenCast",
-            QDBusConnection::sessionBus()
-        );
-        if (!portal.isValid()) {
-            LOG_ERROR("ScreenCast portal interface is not valid");
-            return std::nullopt;
-        }
-
-        const QString tokenBase = QString("chessbotx_%1_%2")
-                                      .arg(QCoreApplication::applicationPid())
-                                      .arg(reinterpret_cast<quintptr>(this));
-
-        QVariantMap createOptions;
-        createOptions["session_handle_token"] = tokenBase + "_session";
-        QVariantMap createResults;
-        if (!portalRequest(portal.call("CreateSession", createOptions), createResults, "CreateSession"))
-            return std::nullopt;
-
-        QString sessionHandle = objectPathFromVariant(createResults.value("session_handle"));
-        if (sessionHandle.isEmpty()) {
-            LOG_ERROR("ScreenCast CreateSession response did not contain session_handle");
-            return std::nullopt;
-        }
-
-        QVariantMap selectOptions;
-        selectOptions["handle_token"] = tokenBase + "_select";
-        selectOptions["types"] = uint(1);      // monitor
-        selectOptions["multiple"] = false;
-        selectOptions["cursor_mode"] = uint(1);
-        if (!portalRequest(portal.call("SelectSources", QDBusObjectPath(sessionHandle), selectOptions),
-                           createResults, "SelectSources")) {
-            return std::nullopt;
-        }
-
-        QVariantMap startOptions;
-        startOptions["handle_token"] = tokenBase + "_start";
-        QVariantMap startResults;
-        if (!portalRequest(portal.call("Start", QDBusObjectPath(sessionHandle), QString(), startOptions),
-                           startResults, "Start")) {
-            return std::nullopt;
-        }
-
-        PortalScreenCastSession session;
-        session.sessionHandle = sessionHandle;
-        parseStreamInfo(startResults, session);
-
-        QDBusMessage fdReply = portal.call("OpenPipeWireRemote", QDBusObjectPath(sessionHandle), QVariantMap{});
-        if (fdReply.type() == QDBusMessage::ErrorMessage) {
-            LOG_ERROR("OpenPipeWireRemote failed: {}", fdReply.errorMessage().toStdString());
-            return std::nullopt;
-        }
-        if (fdReply.arguments().isEmpty() ||
-            !fdReply.arguments().at(0).canConvert<QDBusUnixFileDescriptor>()) {
-            LOG_ERROR("OpenPipeWireRemote did not return a Unix file descriptor");
-            return std::nullopt;
-        }
-
-        QDBusUnixFileDescriptor dbusFd = fdReply.arguments().at(0).value<QDBusUnixFileDescriptor>();
-        session.pipeWireFd = ::dup(dbusFd.fileDescriptor());
-        if (session.pipeWireFd < 0) {
-            LOG_ERROR("dup() failed for PipeWire remote fd");
-            return std::nullopt;
-        }
-        return session;
-    }
-
-    bool portalRequest(const QDBusMessage& reply, QVariantMap& results, const char* name) {
-        if (reply.type() == QDBusMessage::ErrorMessage) {
-            LOG_ERROR("Portal {} failed immediately: {}", name, reply.errorMessage().toStdString());
-            return false;
-        }
-        if (reply.arguments().isEmpty() ||
-            !reply.arguments().at(0).canConvert<QDBusObjectPath>()) {
-            LOG_ERROR("Portal {} did not return a request object path", name);
-            return false;
-        }
-
-        QString requestPath = reply.arguments().at(0).value<QDBusObjectPath>().path();
-        LOG_INFO("Portal {} request: {}", name, requestPath.toStdString());
-        PortalResponseWaiter waiter(requestPath);
-        // Short timeout: if dialog doesn't appear in 5s, skip portal entirely
-        const int timeoutMs = (std::string(name) == "Start") ? 5000 : 3000;
-        if (!waiter.wait(timeoutMs)) {
-            LOG_ERROR("Portal {} response failed/cancelled: code={}", name, waiter.responseCode());
-            return false;
-        }
-        results = waiter.results();
-        LOG_INFO("Portal {} response ok", name);
-        return true;
-    }
-
-    void parseStreamInfo(const QVariantMap& results, PortalScreenCastSession& session) {
-        QVariant streamsValue = results.value("streams");
-        QList<PortalStream> streams = qdbus_cast<QList<PortalStream>>(streamsValue);
-        if (streams.isEmpty()) {
-            LOG_WARN("ScreenCast Start response contains no streams");
-            return;
-        }
-
-        const PortalStream& stream = streams.first();
-        session.nodeId = stream.nodeId;
-        QVariant serial = stream.properties.value("pipewire-serial");
-        if (serial.isValid())
-            session.pipewireSerial = serial.toULongLong();
-
-        LOG_INFO("ScreenCast stream selected: nodeId={} pipewireSerial={} properties={}",
-                 session.nodeId,
-                 session.pipewireSerial,
-                 QStringList(stream.properties.keys()).join(",").toStdString());
-    }
-
-    bool startPipeline() {
-        GstElement* src = gst_element_factory_make("pipewiresrc", "portal-pipewiresrc");
-        GstElement* queue = gst_element_factory_make("queue", "portal-queue");
-        GstElement* convert = gst_element_factory_make("videoconvert", "portal-videoconvert");
-        GstElement* capsFilter = gst_element_factory_make("capsfilter", "portal-caps");
-        GstElement* sink = gst_element_factory_make("appsink", "portal-appsink");
-        m_pipeline = gst_pipeline_new("portal-capture-pipeline");
-
-        if (!m_pipeline || !src || !queue || !convert || !capsFilter || !sink) {
-            LOG_ERROR("Failed to create GStreamer capture pipeline elements");
-            return false;
-        }
-
-        g_object_set(src, "fd", m_pipeWireFd, nullptr);
-        if (!m_targetObject.empty())
-            g_object_set(src, "target-object", m_targetObject.c_str(), nullptr);
-
-        g_object_set(queue,
-                     "leaky", 2,
-                     "max-size-buffers", 1,
-                     "max-size-bytes", 0,
-                     "max-size-time", 0,
-                     nullptr);
-
-        GstCaps* caps = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGR", nullptr);
-        g_object_set(capsFilter, "caps", caps, nullptr);
-        gst_caps_unref(caps);
-
-        g_object_set(sink,
-                     "max-buffers", 1,
-                     "drop", TRUE,
-                     "sync", FALSE,
-                     "emit-signals", FALSE,
-                     nullptr);
-
-        gst_bin_add_many(GST_BIN(m_pipeline), src, queue, convert, capsFilter, sink, nullptr);
-        if (!gst_element_link_many(src, queue, convert, capsFilter, sink, nullptr)) {
-            LOG_ERROR("Failed to link GStreamer capture pipeline");
-            stop();
-            return false;
-        }
-
-        m_appSink = GST_APP_SINK(sink);
-        GstStateChangeReturn state = gst_element_set_state(m_pipeline, GST_STATE_PLAYING);
-        if (state == GST_STATE_CHANGE_FAILURE) {
-            LOG_ERROR("Failed to start GStreamer capture pipeline");
-            stop();
-            return false;
-        }
-
-        LOG_INFO("GStreamer PipeWire capture pipeline started");
-        return true;
-    }
-
-    QImage sampleToImage(GstSample* sample) {
-        GstCaps* caps = gst_sample_get_caps(sample);
-        GstBuffer* buffer = gst_sample_get_buffer(sample);
-        if (!caps || !buffer)
-            return {};
-
-        GstVideoInfo info;
-        if (!gst_video_info_from_caps(&info, caps)) {
-            LOG_ERROR("Failed to parse GStreamer video caps");
-            return {};
-        }
-
-        GstVideoFrame frame;
-        if (!gst_video_frame_map(&frame, &info, buffer, GST_MAP_READ)) {
-            LOG_ERROR("Failed to map GStreamer video frame");
-            return {};
-        }
-
-        const int width = GST_VIDEO_FRAME_WIDTH(&frame);
-        const int height = GST_VIDEO_FRAME_HEIGHT(&frame);
-        const int stride = GST_VIDEO_FRAME_PLANE_STRIDE(&frame, 0);
-        const uchar* data = static_cast<const uchar*>(GST_VIDEO_FRAME_PLANE_DATA(&frame, 0));
-
-        QImage image(data, width, height, stride, QImage::Format_BGR888);
-        QImage copy = image.copy();
-        gst_video_frame_unmap(&frame);
-        return copy;
-    }
-
-    void stop() {
-        if (m_pipeline) {
-            gst_element_set_state(m_pipeline, GST_STATE_NULL);
-            gst_object_unref(m_pipeline);
-            m_pipeline = nullptr;
-            m_appSink = nullptr;
-        }
-        if (m_pipeWireFd >= 0) {
-            ::close(m_pipeWireFd);
-            m_pipeWireFd = -1;
-        }
-    }
-
-    GstElement* m_pipeline = nullptr;
-    GstAppSink* m_appSink = nullptr;
-    int m_pipeWireFd = -1;
-    std::string m_targetObject;
-    bool m_failed = false;
-};
 
 class QtDesktopCapture : public IDesktopCapture {
 public:
@@ -417,35 +93,24 @@ public:
                   std::getenv("XDG_CURRENT_DESKTOP") ? std::getenv("XDG_CURRENT_DESKTOP") : "",
                   wayland ? wayland : "",
                   std::getenv("DISPLAY") ? std::getenv("DISPLAY") : "");
-        // 1. XDG Screenshot portal — works on GNOME Wayland (no user dialog needed after first accept)
+        // 1. grim — Wayland native, fast (~30ms), works on GNOME 41+
+        if (wayland && *wayland) {
+            QImage img = captureGrim(wayland);
+            if (!img.isNull()) return img;
+        }
+
+        // 2. XDG Screenshot portal — fallback if grim absent
         if (wayland && *wayland) {
             QImage portalImg = captureWithScreenshotPortal();
             if (!portalImg.isNull() && isFullRes(portalImg))
                 return portalImg;
         }
 
-        // 2. PipeWire ScreenCast portal (continuous stream — needs user accept)
-        if (wayland && *wayland && !m_portalCapture.hasFailed()) {
-            QImage portalImage = m_portalCapture.captureFrame();
-            if (!portalImage.isNull() && isFullRes(portalImage))
-                return portalImage;
-        }
-
-        // 3. grim (wlroots compositors only — not GNOME)
-        if (wayland && *wayland) {
-            QImage img = captureGrim(wayland);
-            if (!img.isNull()) return img;
-        }
-
-        // 4. GNOME Shell D-Bus (deprecated, often blocked)
-        if (QImage gnomeImage = captureWithGnomeShell(); !gnomeImage.isNull())
-            return gnomeImage;
-
-        // 5. Qt grabWindow (works on real X11, returns black on XWayland root)
+        // 3. Qt grabWindow (pure X11 only, black on XWayland)
         if (QImage qtImage = captureWithQt(screenIndex); !isBlack(qtImage))
             return qtImage;
 
-        // 6. XGetImage (fails on XWayland root, works on pure X11)
+        // 4. XGetImage (pure X11 only)
         if (QImage x11Image = captureWithX11(); !x11Image.isNull())
             return x11Image;
 
@@ -460,16 +125,6 @@ public:
     }
 
 private:
-    PortalGStreamerCapture m_portalCapture;
-
-    static bool isCurrentSessionGnomeWayland() {
-        const char* desktop = std::getenv("XDG_CURRENT_DESKTOP");
-        const char* sessionType = std::getenv("XDG_SESSION_TYPE");
-        const bool isWayland = sessionType && std::strcmp(sessionType, "wayland") == 0;
-        const bool isGnome = desktop && std::string(desktop).find("GNOME") != std::string::npos;
-        return isWayland && isGnome;
-    }
-
     // XDG Desktop Portal Screenshot — single frame, works on GNOME Wayland
     static QImage captureWithScreenshotPortal() {
         QDBusInterface portal(
@@ -573,63 +228,6 @@ private:
 
         LOG_TRACE("Captured screen with Qt backend: {}x{}", image.width(), image.height());
         return image;
-    }
-
-    QImage captureWithGnomeShell() {
-#ifdef Q_OS_LINUX
-        if (!isCurrentSessionGnomeWayland())
-            return {};
-
-        QTemporaryFile temp(QDir::tempPath() + "/chessbotx-capture-XXXXXX.png");
-        temp.setAutoRemove(false);
-        if (!temp.open()) {
-            LOG_ERROR("Failed to create temporary screenshot file");
-            return {};
-        }
-        const QString path = temp.fileName();
-        temp.close();
-        QFile::remove(path);
-
-        QDBusInterface screenshot(
-            "org.gnome.Shell.Screenshot",
-            "/org/gnome/Shell/Screenshot",
-            "org.gnome.Shell.Screenshot"
-        );
-        if (!screenshot.isValid()) {
-            LOG_WARN("GNOME Shell screenshot DBus interface is not available");
-            return {};
-        }
-
-        QDBusMessage reply = screenshot.call("Screenshot", false, false, path);
-        if (reply.type() == QDBusMessage::ErrorMessage) {
-            LOG_ERROR("GNOME Shell screenshot failed: {}", reply.errorMessage().toStdString());
-            QFile::remove(path);
-            return {};
-        }
-
-        bool success = false;
-        if (!reply.arguments().isEmpty())
-            success = reply.arguments().at(0).toBool();
-
-        if (!success) {
-            LOG_ERROR("GNOME Shell screenshot returned success=false");
-            QFile::remove(path);
-            return {};
-        }
-
-        QImage image(path);
-        QFile::remove(path);
-        if (image.isNull()) {
-            LOG_ERROR("GNOME Shell screenshot produced an unreadable image");
-            return {};
-        }
-
-        LOG_TRACE("Captured screen with GNOME Shell DBus backend: {}x{}",
-                  image.width(), image.height());
-        return image;
-#else
-        return {};
-#endif
     }
 
     QImage captureWithX11() {

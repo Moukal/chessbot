@@ -17,7 +17,6 @@ find_package(PkgConfig REQUIRED)
 if(UNIX AND NOT APPLE)
     pkg_check_modules(XTST REQUIRED xtst)
     pkg_check_modules(X11  REQUIRED x11)
-    pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
 endif()
 
 add_executable(chessbotx
@@ -62,12 +61,10 @@ if(UNIX AND NOT APPLE)
     target_include_directories(chessbotx PRIVATE
         ${XTST_INCLUDE_DIRS}
         ${X11_INCLUDE_DIRS}
-        ${GSTREAMER_INCLUDE_DIRS}
     )
     target_link_libraries(chessbotx PRIVATE
         ${XTST_LIBRARIES}
         ${X11_LIBRARIES}
-        ${GSTREAMER_LIBRARIES}
     )
 endif()
 
